@@ -365,6 +365,15 @@ static bool ifdnfc_target_is_available(struct ifd_device *ifdnfc)
   return false;
 }
 
+static bool ifdnfc_nfc_open(struct ifd_device *ifdnfc, nfc_connstring connstring)
+{
+  if(NULL == ifdnfc->device) {
+    ifdnfc->device = nfc_open(context, connstring);
+    ifdnfc->connected = (ifdnfc->device) ? true : false;
+  }
+  return ifdnfc->connected;
+}
+
 /*
  * List of Defined Functions Available to IFD_Handler 3.0
  */
@@ -420,10 +429,11 @@ IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
       strcpy(ifd_connstring, "usb:xxx:xxx");
       memcpy(ifd_connstring + 4, dirname, 3);
       memcpy(ifd_connstring + 8, filename, 3);
-      ifdnfc->device = nfc_open(context, ifd_connstring);
-      ifdnfc->connected = (ifdnfc->device) ? true : false;
+      ifdnfc_nfc_open(ifdnfc, ifd_connstring);
     }
-
+  } else {
+     ifdnfc_nfc_open(ifdnfc, DeviceName);
+  }
   ifdnfc->Lun = Lun;
 
   free(vidpid);
@@ -789,9 +799,7 @@ IFDHControl(DWORD Lun, DWORD dwControlCode, PUCHAR TxBuffer, DWORD TxLength,
           if ((TxLength - (1 + sizeof(u16ConnstringLength))) != u16ConnstringLength)
             return IFD_COMMUNICATION_ERROR;
           memcpy(ifd_connstring, TxBuffer + (1 + sizeof(u16ConnstringLength)), u16ConnstringLength);
-          ifdnfc->device = nfc_open(context, ifd_connstring);
-          ifdnfc->connected = (ifdnfc->device) ? true : false;
-          ifdnfc->Lun = Lun;
+          ifdnfc_nfc_open(ifdnfc, ifd_connstring);
           ifdnfc->secure_element_as_card = (TxBuffer[0] == IFDNFC_SET_ACTIVE_SE);
         }
         break;
