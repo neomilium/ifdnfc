@@ -422,9 +422,10 @@ IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
       memcpy(ifd_connstring + 8, filename, 3);
       ifdnfc->device = nfc_open(context, ifd_connstring);
       ifdnfc->connected = (ifdnfc->device) ? true : false;
-      ifdnfc->Lun = Lun;
     }
-  }
+
+  ifdnfc->Lun = Lun;
+
   free(vidpid);
   free(hpdriver);
   free(ifn);
