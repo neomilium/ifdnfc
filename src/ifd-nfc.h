@@ -31,4 +31,8 @@
 #define IFDNFC_SET_ACTIVE_SE     2
 #define IFDNFC_GET_STATUS        3
 
+#ifndef IFD_NFC_OPEN_RETRY_INTERVAL 
+#define IFD_NFC_OPEN_RETRY_INTERVAL 10
+#endif
+
 #endif

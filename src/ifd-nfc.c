@@ -100,6 +100,7 @@ void log_msg(const int priority, const char *fmt, ...)
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <time.h>
 
 /*
  * This implementation was written based on information provided by the
@@ -128,6 +129,8 @@ struct ifd_device {
   bool connected;
   bool secure_element_as_card;
   int Lun;
+  time_t open_attempted_at;
+  char *ifd_connstring;
 };
 
 nfc_context *context = NULL;
@@ -168,6 +171,10 @@ static void ifdnfc_disconnect(struct ifd_device *ifdnfc)
     ifdnfc->connected = false;
     ifdnfc->device = NULL;
     ifdnfc->Lun = -1;
+    if(ifdnfc->ifd_connstring != NULL) {
+      free(ifdnfc->ifd_connstring);
+      ifdnfc->ifd_connstring = NULL;
+    }
   }
 }
 
@@ -368,6 +375,13 @@ static bool ifdnfc_target_is_available(struct ifd_device *ifdnfc)
 static bool ifdnfc_nfc_open(struct ifd_device *ifdnfc, nfc_connstring connstring)
 {
   if(NULL == ifdnfc->device) {
+    // save connstring for later use, in case we need to retry
+    if(ifdnfc->ifd_connstring == NULL)
+      if((ifdnfc->ifd_connstring = strdup(connstring)) == NULL) {
+        Log1(PCSC_LOG_ERROR, "The strdup of ifd_connstring failed (malloc).");
+        return false;
+      }
+    ifdnfc->open_attempted_at = time(NULL);
     ifdnfc->device = nfc_open(context, connstring);
     ifdnfc->connected = (ifdnfc->device) ? true : false;
   }
@@ -410,6 +424,7 @@ IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
   ifdnfc->device = NULL;
   ifdnfc->connected = false;
   ifdnfc->slot.present = false;
+  ifdnfc->open_attempted_at = (time_t)0;
 
   // USB DeviceNames can be immediately handled, e.g.:
   // usb:1fd3/0608:libudev:0:/dev/bus/usb/002/079
@@ -764,8 +779,14 @@ IFDHICCPresence(DWORD Lun)
   if (device_index < 0)
     return IFD_COMMUNICATION_ERROR;
   struct ifd_device *ifdnfc = &ifd_devices[device_index];
-  if (!ifdnfc->connected)
-    return IFD_ICC_NOT_PRESENT;
+
+  if (!ifdnfc->connected) {
+    if(time(NULL) - ifdnfc->open_attempted_at < IFD_NFC_OPEN_RETRY_INTERVAL)
+      return IFD_ICC_NOT_PRESENT;
+    if(!ifdnfc_nfc_open(ifdnfc, ifdnfc->ifd_connstring))
+      return IFD_ICC_NOT_PRESENT;
+  }
+
   if (ifdnfc->secure_element_as_card)
     return ifdnfc->slot.present ? IFD_SUCCESS : IFD_ICC_NOT_PRESENT; // If available once, available forever :)
   return ifdnfc_target_is_available(ifdnfc) ? IFD_SUCCESS : IFD_ICC_NOT_PRESENT;
