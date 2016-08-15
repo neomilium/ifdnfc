@@ -76,6 +76,11 @@ main(int argc, char *argv[])
   if (rv < 0)
     goto pcsc_error;
 
+  int count;
+  for (reader = mszReaders, count = 0; ++count < dwReaders; reader += strlen(reader) + 1) {
+    printf("READER: '%s'\n", reader);
+  }
+
   int l;
   for (reader = mszReaders;
        dwReaders > 0;

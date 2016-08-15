@@ -131,6 +131,7 @@ struct ifd_device {
   int Lun;
   time_t open_attempted_at;
   char *ifd_connstring;
+  int mode;
 };
 
 nfc_context *context = NULL;
@@ -176,6 +177,7 @@ static void ifdnfc_disconnect(struct ifd_device *ifdnfc)
       ifdnfc->ifd_connstring = NULL;
     }
   }
+  ifdnfc->mode = IFDNFC_SET_INACTIVE;
 }
 
 static bool ifdnfc_target_to_atr(struct ifd_device *ifdnfc)
@@ -425,6 +427,7 @@ IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
   ifdnfc->connected = false;
   ifdnfc->slot.present = false;
   ifdnfc->open_attempted_at = (time_t)0;
+  ifdnfc->mode = IFDNFC_SET_ACTIVE;
 
   // USB DeviceNames can be immediately handled, e.g.:
   // usb:1fd3/0608:libudev:0:/dev/bus/usb/002/079
@@ -781,7 +784,8 @@ IFDHICCPresence(DWORD Lun)
   struct ifd_device *ifdnfc = &ifd_devices[device_index];
 
   if (!ifdnfc->connected) {
-    if(time(NULL) - ifdnfc->open_attempted_at < IFD_NFC_OPEN_RETRY_INTERVAL)
+    Log2(PCSC_LOG_DEBUG, "ifdnfc->mode=%d.", ifdnfc->mode); 
+    if(ifdnfc->mode != IFDNFC_SET_ACTIVE || time(NULL) - ifdnfc->open_attempted_at < IFD_NFC_OPEN_RETRY_INTERVAL)
       return IFD_ICC_NOT_PRESENT;
     if(!ifdnfc_nfc_open(ifdnfc, ifdnfc->ifd_connstring))
       return IFD_ICC_NOT_PRESENT;
@@ -823,6 +827,7 @@ IFDHControl(DWORD Lun, DWORD dwControlCode, PUCHAR TxBuffer, DWORD TxLength,
           ifdnfc_nfc_open(ifdnfc, ifd_connstring);
           ifdnfc->secure_element_as_card = (TxBuffer[0] == IFDNFC_SET_ACTIVE_SE);
         }
+          ifdnfc->mode = *TxBuffer;
         break;
         case IFDNFC_SET_INACTIVE:
           ifdnfc_disconnect(ifdnfc);
@@ -856,6 +861,7 @@ IFDHControl(DWORD Lun, DWORD dwControlCode, PUCHAR TxBuffer, DWORD TxLength,
     default:
       return IFD_ERROR_NOT_SUPPORTED;
   }
+
 
   return IFD_SUCCESS;
 }
