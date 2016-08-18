@@ -68,6 +68,7 @@ void log_msg(const int priority, const char *fmt, ...)
 
 	syslog(syslog_level, "%s", debug_buffer);
 }
+
 #define Log0(priority) log_msg(priority, "%s:%d:%s()", __FILE__, __LINE__, __FUNCTION__)
 #define Log1(priority, fmt) log_msg(priority, "%s:%d:%s() " fmt, __FILE__, __LINE__, __FUNCTION__)
 #define Log2(priority, fmt, data) log_msg(priority, "%s:%d:%s() " fmt, __FILE__, __LINE__, __FUNCTION__, data)
@@ -101,6 +102,8 @@ void log_msg(const int priority, const char *fmt, ...)
 #include <string.h>
 #include <inttypes.h>
 #include <time.h>
+
+extern char *strdup(char *);
 
 /*
  * This implementation was written based on information provided by the
@@ -171,11 +174,6 @@ static void ifdnfc_disconnect(struct ifd_device *ifdnfc)
     nfc_close(ifdnfc->device);
     ifdnfc->connected = false;
     ifdnfc->device = NULL;
-    ifdnfc->Lun = -1;
-    if(ifdnfc->ifd_connstring != NULL) {
-      free(ifdnfc->ifd_connstring);
-      ifdnfc->ifd_connstring = NULL;
-    }
   }
   ifdnfc->mode = IFDNFC_SET_INACTIVE;
 }
@@ -377,15 +375,25 @@ static bool ifdnfc_target_is_available(struct ifd_device *ifdnfc)
 static bool ifdnfc_nfc_open(struct ifd_device *ifdnfc, nfc_connstring connstring)
 {
   if(NULL == ifdnfc->device) {
-    // save connstring for later use, in case we need to retry
-    if(ifdnfc->ifd_connstring == NULL)
-      if((ifdnfc->ifd_connstring = strdup(connstring)) == NULL) {
-        Log1(PCSC_LOG_ERROR, "The strdup of ifd_connstring failed (malloc).");
-        return false;
+    // if we are passed a connect string, save it for later use
+    // for example we save the connstring passed in IFDHCreateChannelByName and use it for
+    // connect attempts in IFDHICCPresence or in IFDHControl.
+    if(connstring != NULL && strchr(connstring, ':') != NULL) {
+      if(ifdnfc->ifd_connstring == NULL)
+        ifdnfc->ifd_connstring = malloc(strlen(connstring));
+      else
+        ifdnfc->ifd_connstring = realloc(ifdnfc->ifd_connstring, strlen(connstring));
+      if(ifdnfc->ifd_connstring == NULL) {
+          Log1(PCSC_LOG_ERROR, "The strdup of ifd_connstring failed (malloc/realloc).");
+          return false;
       }
-    ifdnfc->open_attempted_at = time(NULL);
-    ifdnfc->device = nfc_open(context, connstring);
-    ifdnfc->connected = (ifdnfc->device) ? true : false;
+      strcpy(ifdnfc->ifd_connstring, connstring);
+    }
+    if(ifdnfc->ifd_connstring != NULL && *ifdnfc->ifd_connstring != 0) {
+      ifdnfc->open_attempted_at = time(NULL);
+      ifdnfc->device = nfc_open(context, ifdnfc->ifd_connstring);
+      ifdnfc->connected = (ifdnfc->device != NULL ? true : false);
+    }
   }
   return ifdnfc->connected;
 }
@@ -427,7 +435,7 @@ IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
   ifdnfc->connected = false;
   ifdnfc->slot.present = false;
   ifdnfc->open_attempted_at = (time_t)0;
-  ifdnfc->mode = IFDNFC_SET_ACTIVE;
+  ifdnfc->mode = IFDNFC_SET_INACTIVE;
 
   // USB DeviceNames can be immediately handled, e.g.:
   // usb:1fd3/0608:libudev:0:/dev/bus/usb/002/079
@@ -448,9 +456,16 @@ IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
       memcpy(ifd_connstring + 4, dirname, 3);
       memcpy(ifd_connstring + 8, filename, 3);
       ifdnfc_nfc_open(ifdnfc, ifd_connstring);
+      ifdnfc->mode = IFDNFC_SET_ACTIVE;
     }
   } else {
-     ifdnfc_nfc_open(ifdnfc, DeviceName);
+     if(DeviceName != NULL && strchr(DeviceName, ':') != NULL) {
+       // Compatibility with prior versions of code:  If devicename does not contain a colon, it has not been configured
+       // as a valid nfc_connstring.  Do not go into ACTIVE mode, wait for control message from ifdnfc-activate.
+       // But if there is a colon, go into ACTIVE mode now.
+       ifdnfc_nfc_open(ifdnfc, DeviceName);
+       ifdnfc->mode = IFDNFC_SET_ACTIVE;
+     }
   }
   ifdnfc->Lun = Lun;
 
@@ -489,6 +504,12 @@ IFDHCloseChannel(DWORD Lun)
     return IFD_COMMUNICATION_ERROR;
   struct ifd_device *ifdnfc = &ifd_devices[device_index];
   ifdnfc_disconnect(ifdnfc);
+
+  ifdnfc->Lun = -1;
+  if(ifdnfc->ifd_connstring != NULL) {
+    free(ifdnfc->ifd_connstring);
+    ifdnfc->ifd_connstring = NULL;
+  }
 
   // Check if there are still devices used
   int i;
@@ -784,9 +805,13 @@ IFDHICCPresence(DWORD Lun)
   struct ifd_device *ifdnfc = &ifd_devices[device_index];
 
   if (!ifdnfc->connected) {
-    Log2(PCSC_LOG_DEBUG, "ifdnfc->mode=%d.", ifdnfc->mode); 
-    if(ifdnfc->mode != IFDNFC_SET_ACTIVE || time(NULL) - ifdnfc->open_attempted_at < IFD_NFC_OPEN_RETRY_INTERVAL)
+    // check that we are in an active mode 
+    if(!(ifdnfc->mode == IFDNFC_SET_ACTIVE || ifdnfc->mode == IFDNFC_SET_ACTIVE_SE))
       return IFD_ICC_NOT_PRESENT;
+    // check that enough time has elapsed since the last attempt
+    if(time(NULL) - ifdnfc->open_attempted_at < IFD_NFC_OPEN_RETRY_INTERVAL)
+      return IFD_ICC_NOT_PRESENT;
+    // try to open
     if(!ifdnfc_nfc_open(ifdnfc, ifdnfc->ifd_connstring))
       return IFD_ICC_NOT_PRESENT;
   }
@@ -811,26 +836,22 @@ IFDHControl(DWORD Lun, DWORD dwControlCode, PUCHAR TxBuffer, DWORD TxLength,
 
   switch (dwControlCode) {
     case IFDNFC_CTRL_ACTIVE:
-      if (TxLength < 1 || !TxBuffer || RxLength < 1 || !RxBuffer)
+      if (TxLength != sizeof(IFDNFC_CONTROL_REQ) || !TxBuffer || RxLength != sizeof(IFDNFC_CONTROL_RESP) || !RxBuffer)
         return IFD_COMMUNICATION_ERROR;
 
-      switch (*TxBuffer) {
+      IFDNFC_CONTROL_REQ *req = (IFDNFC_CONTROL_REQ *)TxBuffer;
+      IFDNFC_CONTROL_RESP *rsp  = (IFDNFC_CONTROL_RESP *)RxBuffer;
+
+      switch (req->command) {
         case IFDNFC_SET_ACTIVE:
-        case IFDNFC_SET_ACTIVE_SE: {
-          uint16_t u16ConnstringLength;
-          if (TxLength < (1 + sizeof(u16ConnstringLength)))
-            return IFD_COMMUNICATION_ERROR;
-          memcpy(&u16ConnstringLength, TxBuffer + 1, sizeof(u16ConnstringLength));
-          if ((TxLength - (1 + sizeof(u16ConnstringLength))) != u16ConnstringLength)
-            return IFD_COMMUNICATION_ERROR;
-          memcpy(ifd_connstring, TxBuffer + (1 + sizeof(u16ConnstringLength)), u16ConnstringLength);
-          ifdnfc_nfc_open(ifdnfc, ifd_connstring);
-          ifdnfc->secure_element_as_card = (TxBuffer[0] == IFDNFC_SET_ACTIVE_SE);
-        }
-          ifdnfc->mode = *TxBuffer;
-        break;
+        case IFDNFC_SET_ACTIVE_SE:
+          ifdnfc_nfc_open(ifdnfc, req->connstring);
+          ifdnfc->secure_element_as_card = (req->command == IFDNFC_SET_ACTIVE_SE);
+          ifdnfc->mode = req->command;
+          break;
         case IFDNFC_SET_INACTIVE:
           ifdnfc_disconnect(ifdnfc);
+          ifdnfc->mode = req->command;
           break;
         case IFDNFC_GET_STATUS:
           break;
@@ -843,25 +864,24 @@ IFDHControl(DWORD Lun, DWORD dwControlCode, PUCHAR TxBuffer, DWORD TxLength,
           return IFD_COMMUNICATION_ERROR;
       }
 
-      if ((ifdnfc->connected) && ((!ifdnfc->secure_element_as_card) || ifdnfc_se_is_available(ifdnfc))) {
-        Log1(PCSC_LOG_INFO, "IFD-handler for libnfc is active.");
-        RxBuffer[0] = IFDNFC_IS_ACTIVE;
-        const uint16_t u16ConnstringLength = strlen(ifd_connstring) + 1;
-        memcpy(RxBuffer + 1, &u16ConnstringLength, sizeof(u16ConnstringLength));
-        memcpy(RxBuffer + 1 + sizeof(u16ConnstringLength), ifd_connstring, u16ConnstringLength);
-        if (pdwBytesReturned)
-          *pdwBytesReturned = 1 + sizeof(u16ConnstringLength) + u16ConnstringLength;
-      } else {
-        Log1(PCSC_LOG_INFO, "IFD-handler for libnfc is inactive.");
-        if (pdwBytesReturned)
-          *pdwBytesReturned = 1;
-        *RxBuffer = IFDNFC_IS_INACTIVE;
-      }
+      memset(rsp, 0, sizeof(IFDNFC_CONTROL_RESP));
+      rsp->mode = ifdnfc->mode;     
+      rsp->connected = ifdnfc->connected;
+      if(ifdnfc->ifd_connstring != NULL)
+        strncpy(rsp->connstring, ifdnfc->ifd_connstring, sizeof(nfc_connstring)-1);
+
+      if (ifdnfc->connected && ifdnfc->secure_element_as_card && ifdnfc_se_is_available(ifdnfc))
+        rsp->se_avail = 1;
+        
+      *pdwBytesReturned = sizeof(IFDNFC_CONTROL_RESP);
+
+      Log9(PCSC_LOG_INFO, "Lun '%0x', mode='%d', connected='%s', se='%s', connstring='%s'.", 
+        Lun, rsp->mode, (rsp->connected ? "Yes" : "No"), (rsp->se_avail ? "Yes" : "No"), rsp->connstring,
+        NULL, NULL, NULL);
       break;
     default:
       return IFD_ERROR_NOT_SUPPORTED;
   }
-
 
   return IFD_SUCCESS;
 }
