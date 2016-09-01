@@ -103,8 +103,6 @@ void log_msg(const int priority, const char *fmt, ...)
 #include <inttypes.h>
 #include <time.h>
 
-extern char *strdup(char *);
-
 /*
  * This implementation was written based on information provided by the
  * following documents:
