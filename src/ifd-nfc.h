@@ -31,4 +31,21 @@
 #define IFDNFC_SET_ACTIVE_SE     2
 #define IFDNFC_GET_STATUS        3
 
+#ifndef IFD_NFC_OPEN_RETRY_INTERVAL 
+#define IFD_NFC_OPEN_RETRY_INTERVAL 10
+#endif
+
+#include <nfc/nfc.h>
+typedef struct {
+    int command;
+    nfc_connstring connstring;
+} IFDNFC_CONTROL_REQ;
+
+typedef struct {
+    int mode;
+    int connected;
+    int se_avail;
+    nfc_connstring connstring;
+} IFDNFC_CONTROL_RESP;
+
 #endif

@@ -24,6 +24,8 @@
 #include <inttypes.h>
 #include <winscard.h>
 #include <nfc/nfc.h>
+#include <strings.h>
+#include <errno.h>
 
 #define MAX_DEVICE_COUNT 16
 
@@ -33,99 +35,39 @@ typedef uint32_t DWORD;
 typedef uint8_t BYTE;
 #endif
 
-int
-main(int argc, char *argv[])
-{
-  LONG rv;
-  SCARDCONTEXT hContext;
-  SCARDHANDLE hCard;
-  char *reader;
-  BYTE pbSendBuffer[1 + 1 + sizeof(nfc_connstring)];
-  DWORD dwSendLength;
-  BYTE pbRecvBuffer[1];
-  DWORD dwActiveProtocol, dwRecvLength, dwReaders;
-  char* mszReaders = NULL;
-
-  if (argc == 1 ||
-      (argc == 2 && (strncmp(argv[1], "yes", strlen("yes")) == 0)))
-    pbSendBuffer[0] = IFDNFC_SET_ACTIVE;
-  else if (argc == 2 && (strncmp(argv[1], "no", strlen("no")) == 0))
-    pbSendBuffer[0] = IFDNFC_SET_INACTIVE;
-  else if (argc == 2 && (strncmp(argv[1], "se", strlen("se")) == 0))
-    pbSendBuffer[0] = IFDNFC_SET_ACTIVE_SE;
-  else if (argc == 2 && (strncmp(argv[1], "status", strlen("status")) == 0))
-    pbSendBuffer[0] = IFDNFC_GET_STATUS;
-  else {
-    printf("Usage: %s [yes|no|status]\n", argv[0]);
-    exit(EXIT_FAILURE);
+char *mode_to_str(int mode) {
+  switch(mode) {
+    case IFDNFC_SET_INACTIVE:
+        return "Inactive";
+    case IFDNFC_SET_ACTIVE:
+        return "Active";
+    case IFDNFC_SET_ACTIVE_SE:
+        return "Active Secure Element";
+    default:
+        return "Undefined";
   }
+}
 
+int get_connstring(nfc_connstring *pConnstring) {
+    
+    (*pConnstring)[0] = 0;
 
-  rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &hContext);
-  if (rv < 0)
-    goto pcsc_error;
-
-  dwReaders = 0;
-  // Ask how many bytes readers list take
-  rv = SCardListReaders(hContext, NULL, NULL, &dwReaders);
-  if (rv < 0)
-    goto pcsc_error;
-  // Then allocate and fill mszReaders
-  mszReaders = malloc(dwReaders);
-  rv = SCardListReaders(hContext, NULL, mszReaders, &dwReaders);
-  if (rv < 0)
-    goto pcsc_error;
-
-  int l;
-  for (reader = mszReaders;
-       dwReaders > 0;
-       l = strlen(reader) + 1, dwReaders -= l, reader += l) {
-    if (strcmp(IFDNFC_READER_NAME, reader) <= 0)
-      break;
-  }
-  if (dwReaders <= 0) {
-    printf("Could not find a reader named: %s\n", IFDNFC_READER_NAME);
-    rv = SCARD_E_NO_READERS_AVAILABLE;
-    goto pcsc_error;
-  }
-
-  // TODO Handle multiple ifdnfc instance for multiple NFC device ?
-  rv = SCardConnect(hContext, reader, SCARD_SHARE_DIRECT, 0, &hCard,
-                    &dwActiveProtocol);
-  if (rv < 0)
-    goto pcsc_error;
-
-  if ((pbSendBuffer[0] == IFDNFC_SET_ACTIVE) || (pbSendBuffer[0] == IFDNFC_SET_ACTIVE_SE))  {
-    const BYTE command = pbSendBuffer[0];
-    // To correctly probe NFC devices, ifdnfc must be disactivated first
-    pbSendBuffer[0] = IFDNFC_SET_INACTIVE;
-    dwSendLength = 1;
-    rv = SCardControl(hCard, IFDNFC_CTRL_ACTIVE, pbSendBuffer,
-                      dwSendLength, pbRecvBuffer, sizeof(pbRecvBuffer),
-                      &dwRecvLength);
-    if (rv < 0) {
-      goto pcsc_error;
-    }
-
-    pbSendBuffer[0] = command;
     // Initialize libnfc
     nfc_context *context;
     nfc_init(&context);
     if (context == NULL) {
-      fprintf(stderr, "Unable to init libnfc (malloc)\n");
-      goto error;
+      fprintf(stderr, "Unable to init libnfc: %s\n", strerror(errno));
+      return -1;
     }
-    // Allocate nfc_connstring array
+    
+    // List devices    
     nfc_connstring connstrings[MAX_DEVICE_COUNT];
-    // List devices
     size_t szDeviceFound = nfc_list_devices(context, connstrings, MAX_DEVICE_COUNT);
 
-    int connstring_index = -1;
+    int connstring_index = -1, selection;
     switch (szDeviceFound) {
       case 0:
         fprintf(stderr, "Unable to activate ifdnfc: no NFC device found.\n");
-        nfc_exit(context);
-        goto error;
         break;
       case 1:
         // Only one NFC device available, so auto-select it!
@@ -140,84 +82,195 @@ main(int argc, char *argv[])
             printf("[%d] %s\t  (%s)\n", (int)i, nfc_device_get_name(pnd), nfc_device_get_connstring(pnd));
             nfc_close(pnd);
           } else {
-            fprintf(stderr, "nfc_open failed for %s\n", connstrings[i]);
+            fprintf(stderr, "nfc_open failed for %s.\n", connstrings[i]);
           }
         }
-        // libnfc isn't needed anymore
-        nfc_exit(context);
+
         printf(">> ");
         // Take user's choice
-        if (1 != scanf("%2d", &connstring_index)) {
+        if (1 != scanf("%2d", &selection)) {
           fprintf(stderr, "Value must an integer.\n");
-          goto error;
+          break;
         }
-        if ((connstring_index < 0) || (connstring_index >= (int)szDeviceFound)) {
+        if ((selection < 0) || (selection >= (int)szDeviceFound)) {
           fprintf(stderr, "Invalid index selection.\n");
-          goto error;
+          break;
         }
+        connstring_index = selection;
         break;
     }
-    printf("Activating ifdnfc with \"%s\"...\n", connstrings[connstring_index]);
-    // pbSendBuffer = { IFDNFC_SET_ACTIVE (1 byte), length (2 bytes), nfc_connstring (lenght bytes)}
-    const uint16_t u16ConnstringLength = strlen(connstrings[connstring_index]) + 1;
-    memcpy(pbSendBuffer + 1, &u16ConnstringLength, sizeof(u16ConnstringLength));
-    memcpy(pbSendBuffer + 1 + sizeof(u16ConnstringLength), connstrings[connstring_index], u16ConnstringLength);
-    dwSendLength = 1 + sizeof(u16ConnstringLength) + u16ConnstringLength;
-  } else {
-    // pbSendBuffer[0] != IFDNFC_SET_ACTIVE
-    dwSendLength = 1;
-  }
-
-  rv = SCardControl(hCard, IFDNFC_CTRL_ACTIVE, pbSendBuffer,
-                    dwSendLength, pbRecvBuffer, sizeof(pbRecvBuffer),
-                    &dwRecvLength);
-  if (rv < 0) {
-    goto pcsc_error;
-  }
-  if (dwRecvLength < 1) {
-    rv = SCARD_F_INTERNAL_ERROR;
-    goto pcsc_error;
-  }
-
-  switch (pbRecvBuffer[0]) {
-    case IFDNFC_IS_ACTIVE: {
-      uint16_t u16ConnstringLength;
-      if (dwRecvLength < (1 + sizeof(u16ConnstringLength))) {
-        rv = SCARD_F_INTERNAL_ERROR;
-        goto pcsc_error;
-      }
-      memcpy(&u16ConnstringLength, pbRecvBuffer + 1, sizeof(u16ConnstringLength));
-      if ((dwRecvLength - (1 + sizeof(u16ConnstringLength))) != u16ConnstringLength) {
-        rv = SCARD_F_INTERNAL_ERROR;
-        goto pcsc_error;
-      }
-      nfc_connstring connstring;
-      memcpy(connstring, pbRecvBuffer + 1 + sizeof(u16ConnstringLength), u16ConnstringLength);
-      printf("%s is active using %s.\n", IFDNFC_READER_NAME, connstring);
+    nfc_exit(context);
+    if(connstring_index > -1) {
+      strncpy(*pConnstring, connstrings[connstring_index], sizeof(nfc_connstring));
+      (*pConnstring)[sizeof(nfc_connstring)-1] = 0;
+      return 0;
     }
-    break;
-    case IFDNFC_IS_INACTIVE:
-      printf("%s is inactive.\n", IFDNFC_READER_NAME);
+    return 1;
+}
+
+int print_status(char *reader, IFDNFC_CONTROL_RESP *rxmsg, int rxlen) {
+  if(rxlen != sizeof(IFDNFC_CONTROL_RESP)) { 
+    printf("Reader '%s', PCSC Control Error (while getting status): %d length response from PCSC, expected %d.\n", 
+      reader, rxlen, sizeof(rxmsg));
+    return -1;
+  }
+  printf("Reader '%s', mode='%s', connected='%s', se='%s', connstring='%s'.\n", 
+    reader, mode_to_str(rxmsg->mode), 
+    (rxmsg->connected ? "Yes" : "No"), 
+    (rxmsg->se_avail ? "Yes" : "No"), 
+    rxmsg->connstring);
+  return 0;
+}
+
+int
+main(int argc, char *argv[])
+{
+  LONG rv;
+  SCARDCONTEXT hContext;
+  SCARDHANDLE hCard;
+  char *reader;
+  DWORD dwActiveProtocol, rxlen, dwReaders;
+  char* mszReaders = NULL;
+  char *devicename_prefix = IFDNFC_READER_NAME;
+
+  IFDNFC_CONTROL_REQ txmsg;
+  IFDNFC_CONTROL_RESP rxmsg;
+
+  nfc_connstring connstring;
+
+  int command = -1;
+
+  switch(argc) {
+    case 1:
+      command = IFDNFC_SET_ACTIVE;
+      break;
+    case 2:
+    case 3:
+      if(!strcmp(argv[1], "yes"))
+        command = IFDNFC_SET_ACTIVE;
+      else 
+        if(!strcmp(argv[1], "no"))
+          command = IFDNFC_SET_INACTIVE;
+        else 
+          if(!strcmp(argv[1], "se"))
+            command = IFDNFC_SET_ACTIVE_SE;
+          else 
+            if(!strcmp(argv[1], "status"))
+              command = IFDNFC_GET_STATUS;
+      if(argc == 3)
+        devicename_prefix = argv[2];
       break;
     default:
-      rv = SCARD_F_INTERNAL_ERROR;
-      goto pcsc_error;
+      break;
   }
 
+  if(command < 0) {
+    printf("Usage: %s [yes|no|status] [nameprefix]\n", argv[0]);
+    exit(EXIT_FAILURE);
+  }
+  
+  if((rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &hContext)) < 0) {
+    printf("SCardEstablishContext Error: %s\n", pcsc_stringify_error(rv));
+    exit(EXIT_FAILURE);
+  }
 
-  rv = SCardDisconnect(hCard, SCARD_LEAVE_CARD);
-  if (rv < 0)
-    goto pcsc_error;
+  dwReaders = 0;
+  // Ask how many bytes readers list take
+  if((rv = SCardListReaders(hContext, NULL, NULL, &dwReaders)) >= 0) {
+    // Then allocate and fill mszReaders
+    mszReaders = malloc(dwReaders);
+    rv = SCardListReaders(hContext, NULL, mszReaders, &dwReaders);
+  }
+  if(rv < 0) {
+    printf("SCardListReaders Error: %s\n", pcsc_stringify_error(rv));
+    free(mszReaders);
+    exit(EXIT_FAILURE);
+  }
 
+  int l, foundcount = 0, prefixlen = strlen(devicename_prefix);
+  for(reader = mszReaders; dwReaders > 0; l = strlen(reader) + 1, dwReaders -= l, reader += l) {
+    // If reader FRIENDLYNAME does not start with "IFD-NFC" (the default) or specified prefix, we skip it.
+    printf("'%s' '%s' %d\n", devicename_prefix, reader, prefixlen);
+    if(strncmp(devicename_prefix, reader, prefixlen) != 0)
+      continue;
+
+    foundcount++;
+
+    if((rv = SCardConnect(hContext, reader, SCARD_SHARE_DIRECT, 0, &hCard, &dwActiveProtocol)) < 0) {
+      printf("Reader '%s', SCardConnect Error: %s\n", reader, pcsc_stringify_error(rv));
+      continue;
+    }
+        
+    switch(command) {
+      case IFDNFC_SET_ACTIVE:
+      case IFDNFC_SET_ACTIVE_SE:
+        if(!strcmp(devicename_prefix, IFDNFC_READER_NAME)) {
+          // Backward compatibility, if friendlyname is just "IFD-NFC" then we assume that there is one and only one
+          // device that we are accessing through ifdnfc, and that DEVICENAME is missing or not meaningful, eg:
+          //   FRIENDLYNAME "IFD-NFC"
+          memset(&txmsg, 0, sizeof(txmsg));
+          txmsg.command = IFDNFC_SET_INACTIVE;
+          if((rv = SCardControl(hCard, IFDNFC_CTRL_ACTIVE, &txmsg, sizeof(txmsg), &rxmsg, sizeof(rxmsg), &rxlen)) < 0) {
+            printf("Reader '%s', SCardControl Error (Setting Inactive): %s\n", reader, pcsc_stringify_error(rv));
+            break;
+          }
+          if(get_connstring(&connstring) != 0) {
+            printf("Reader '%s', did not get NFC connect string so can't activate.\n", reader);
+            break;
+          }
+          printf("Reader '%s', activating ifdnfc with '%s'.\n", reader, connstring);
+        } else {
+          // In the new, multiple-device capable method, FRIENLYNAME should be in the form IFD-NFC-unique,
+          // and DEVICENAME must be the libnfc connstring, eg, /etc/readers.d/reader_1.conf:
+          //   FRIENDLYNAME "IFD-NFC-NXP-PN532.1"
+          //   DEVICENAME pn532_uart:/dev/ttyS0
+          //   LIBPATH /usr/lib/pcsc/drivers/ifdnfc.bundle/Contents/Linux/libifdnfc.so.0.1.4
+          // Since pcscd passes DEVICENAME to ifdnfc, we don't need to know it here.
+          printf("Reader '%s', activating ifdnfc using nfc_connstring in pcscd DEVICENAME.\n", reader);
+          connstring[0] = 0;
+        }
+        memset(&txmsg, 0, sizeof(txmsg));
+        txmsg.command = command;
+        strncpy(txmsg.connstring, connstring, sizeof(txmsg.connstring));
+        txmsg.connstring[sizeof(txmsg.connstring)-1] = 0;
+        // pbSendBuf = { IFDNFC_SET_ACTIVE (1 byte), length (2 bytes), nfc_connstring (lenght bytes)}
+        if((rv = SCardControl(hCard, IFDNFC_CTRL_ACTIVE, &txmsg, sizeof(txmsg), &rxmsg, sizeof(rxmsg), &rxlen)) < 0) {
+          printf("Reader '%s', SCardControl Error (while setting mode %d): %s\n", reader, command, pcsc_stringify_error(rv));
+          break;
+        }
+        print_status(reader, &rxmsg, rxlen);
+        break;
+      case IFDNFC_SET_INACTIVE:
+        memset(&txmsg, 0, sizeof(txmsg));
+        txmsg.command = command;
+        if((rv = SCardControl(hCard, IFDNFC_CTRL_ACTIVE, &txmsg, sizeof(txmsg), &rxmsg, sizeof(rxmsg), &rxlen)) < 0) {
+          printf("Reader '%s', SCardControl Error (while setting Inactive): %s\n", reader, pcsc_stringify_error(rv));
+          break;
+        }
+        print_status(reader, &rxmsg, rxlen);
+        break;
+      case IFDNFC_GET_STATUS:
+        memset(&txmsg, 0, sizeof(txmsg));
+        txmsg.command = command;
+        if((rv = SCardControl(hCard, IFDNFC_CTRL_ACTIVE, &txmsg, sizeof(txmsg), &rxmsg, sizeof(rxmsg), &rxlen)) < 0) {
+          printf("Reader '%s', SCardControl Error (while getting status): %s\n", reader, pcsc_stringify_error(rv));
+          break;
+        }
+        print_status(reader, &rxmsg, rxlen);
+        break;
+      default:
+        printf("Invalid command number: %d.\n", command);
+    }  
+  }
+
+  if((rv = SCardDisconnect(hCard, SCARD_LEAVE_CARD)) < 0) {
+    printf("SCardDisconnect Error: %s\n", pcsc_stringify_error(rv));
+  }
   free(mszReaders);
 
+  if(!foundcount) {
+    printf("Could not find any pcsc readers with name prefix of: %s.  Check your configuration.\n", IFDNFC_READER_NAME);
+    exit(EXIT_FAILURE);
+  }
   exit(EXIT_SUCCESS);
-
-pcsc_error:
-  puts(pcsc_stringify_error(rv));
-error:
-  if (mszReaders)
-    free(mszReaders);
-
-  exit(EXIT_FAILURE);
 }
